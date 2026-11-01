@@ -1,0 +1,18 @@
+{
+  "name": "gge-tracker-api",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gge-tracker",
+      "database_id": "d1e3fbba-b3b9-4e0d-8aa6-1f3c25b9b705"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "vars": {
+    "ALLOWED_ORIGIN": "https://ggetest.takutaku307.workers.dev"
+  }
+}
