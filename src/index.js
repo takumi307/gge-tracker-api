@@ -47,6 +47,7 @@ const SCHEMA = [
     deleted INTEGER NOT NULL DEFAULT 0, touched_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (user_id, id))`,
   `CREATE INDEX IF NOT EXISTS idx_history_touched ON history (user_id, touched_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_history_tomb ON history (user_id, touched_at) WHERE deleted=1`,
   `CREATE TABLE IF NOT EXISTS settings (
     user_id TEXT NOT NULL, channel TEXT NOT NULL, json TEXT NOT NULL,
     PRIMARY KEY (user_id, channel))`
@@ -296,14 +297,33 @@ function normalizeHist(h) {
 
 async function addHistory(env, userId, req, out, now) {
   const since = Number(req.historySince) || 0
-  const { results } = await env.DB.prepare('SELECT id, deleted FROM history WHERE user_id=?').bind(userId).all()
-  const cur = new Map(results.map((r) => [r.id, !!r.deleted]))
-  const stmts = []
-  const rejected = []
-
+  const recs = []
   asArr(req.history).slice(0, MAX_HIST).forEach((h) => {
     const rec = normalizeHist(h)
-    if (!rec) return
+    if (rec) recs.push(rec)
+  })
+
+  // 送られてきたIDの現状だけを読む（履歴の全件は読まない）。
+  // IDは90件ずつの照会にして、複数をまとめて1回のバッチで実行する
+  const cur = new Map()
+  const ids = Array.from(new Set(recs.map((r) => r.id)))
+  const lookups = []
+  for (let i = 0; i < ids.length; i += 90) {
+    const chunk = ids.slice(i, i + 90)
+    lookups.push(
+      env.DB.prepare(
+        `SELECT id, deleted FROM history WHERE user_id=? AND id IN (${chunk.map(() => '?').join(',')})`
+      ).bind(userId, ...chunk)
+    )
+  }
+  for (let i = 0; i < lookups.length; i += 40) {
+    const rs = await env.DB.batch(lookups.slice(i, i + 40))
+    rs.forEach((r) => r.results.forEach((row) => cur.set(row.id, !!row.deleted)))
+  }
+
+  const stmts = []
+  const rejected = []
+  recs.forEach((rec) => {
     const exists = cur.has(rec.id)
     if (rec.deleted) {
       if (!exists) {
@@ -325,6 +345,7 @@ async function addHistory(env, userId, req, out, now) {
   stmts.push(env.DB.prepare('DELETE FROM history WHERE user_id=? AND deleted=1 AND touched_at<?').bind(userId, now - HIST_TOMB_KEEP_MS))
   await runBatch(env, stmts)
 
+  // 前回の同期以降に変わった行だけを返す
   const rows = await env.DB.prepare(
     'SELECT id, type, entry_id, label, x, y, result, ruby, at_ms, deleted FROM history WHERE user_id=? AND touched_at>=?'
   ).bind(userId, since).all()
