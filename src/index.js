@@ -30,6 +30,10 @@ const MAX_ITEMS = 1000
 const MAX_HIST = 3000
 const GRACE_MIN = 10          // 時刻から何分以内なら「通常の通知」にするか
 const DIGEST_MAX_AGE_H = 12   // まとめ通知に含める最大の遅れ（時間）
+const MAX_MESSAGES_PER_RUN = 5 // 1グループが1回の実行で送るDiscordメッセージの上限
+const MESSAGE_GAP_MS = 1200    // メッセージの間隔（Discordの送信制限対策）
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /* ================= スキーマ（初回アクセス時に自動作成） ================= */
 const SCHEMA = [
@@ -245,10 +249,18 @@ async function handleSync(env, dataUser, channel, req) {
     if (!rec) return
     if (channel === 'aqua') rec.notify = true // アクアの通知対象は、通知設定の「種類」で決める
     const cur = map.get(rec.key)
-    if (!cur) { map.set(rec.key, rec); dirty.add(rec.key); return }
+    if (!cur) {
+      // 登録した時点ですでに攻撃可能だったもの（時刻が更新日時以前）は、通知の対象にしない
+      if (!rec.deleted && rec.eventAt <= rec.updatedAt) rec.notified = rec.eventAt
+      map.set(rec.key, rec)
+      dirty.add(rec.key)
+      return
+    }
     if (wins(rec, cur)) {
       // 同じ時刻なら「通知済み」を引き継ぐ（時刻が変わったら、また通知する）
-      rec.notified = !rec.deleted && cur.eventAt === rec.eventAt ? cur.notified : 0
+      const sameTime = !rec.deleted && cur.eventAt === rec.eventAt
+      rec.notified = sameTime ? cur.notified : 0
+      if (!sameTime && !rec.deleted && rec.eventAt <= rec.updatedAt) rec.notified = rec.eventAt
       map.set(rec.key, rec)
       dirty.add(rec.key)
     } else if (!rec.deleted && !cur.deleted && rec.updatedAt === cur.updatedAt && rec.eventAt === cur.eventAt && cur.notify !== rec.notify) {
@@ -428,32 +440,26 @@ async function handleSettings(env, dataUser, channel, body) {
 }
 
 /* ================= Discord ================= */
-async function sendDiscord(url, text, roleId) {
-  const chunks = []
-  let cur = ''
-  String(text).split('\n').forEach((line) => {
-    if ((cur + line).length > 1800 && cur) { chunks.push(cur); cur = '' }
-    cur += line + '\n'
-  })
-  if (cur) chunks.push(cur)
-  let ok = true
-  for (const c of chunks) {
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: c, allowed_mentions: { parse: [], roles: roleId ? [String(roleId)] : [] } })
-      })
-      if (!res.ok) {
-        console.error('Discord HTTP ' + res.status + ': ' + (await res.text()))
-        ok = false
-      }
-    } catch (e) {
-      console.error('Discord通信エラー', e)
-      ok = false
+async function postDiscord(url, text, roleId) {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text, allowed_mentions: { parse: [], roles: roleId ? [String(roleId)] : [] } })
+    })
+    if (!res.ok) {
+      console.error('Discord HTTP ' + res.status + ': ' + (await res.text()))
+      return { ok: false, status: res.status }
     }
+    return { ok: true, status: res.status }
+  } catch (e) {
+    console.error('Discord通信エラー', e)
+    return { ok: false, status: 0 }
   }
-  return ok
+}
+
+async function sendDiscord(url, text, roleId) {
+  return (await postDiscord(url, text, roleId)).ok
 }
 
 /* テスト送信：body.webhookUrl があればそのURLへ（未保存のURLも試せる）、なければ登録済みのURLへ */
@@ -477,6 +483,32 @@ function isQuiet(st, hour) {
   if (!st.quietOn || st.quietStart === st.quietEnd) return false
   if (st.quietStart < st.quietEnd) return hour >= st.quietStart && hour < st.quietEnd
   return hour >= st.quietStart || hour < st.quietEnd
+}
+
+/* 通知の行を、Discordの文字数制限（1800字）に収まるメッセージにまとめる。
+ * 各メッセージが、どの行（どの対象）を含むかも記録する */
+function packMessages(dueItems, lateItems, roleId, lateHeader) {
+  const msgs = []
+  let cur = null
+  const start = () => {
+    cur = { text: roleId ? '<@&' + roleId + '>\n' : '', rows: [], lateStarted: false }
+    msgs.push(cur)
+  }
+  const add = (text, row, isLate) => {
+    if (!cur) start()
+    let chunk = text + '\n'
+    if (isLate && !cur.lateStarted) chunk = (cur.rows.length ? '\n' : '') + lateHeader + '\n' + chunk
+    if (cur.text.length + chunk.length > 1800 && cur.rows.length) {
+      start()
+      chunk = (isLate ? lateHeader + '\n' : '') + text + '\n'
+    }
+    cur.text += chunk
+    cur.rows.push(row)
+    if (isLate) cur.lateStarted = true
+  }
+  dueItems.forEach((i) => add(i.text, i.row, false))
+  lateItems.forEach((i) => add(i.text, i.row, true))
+  return msgs
 }
 
 /* ================= 5分おきの通知チェック（Cron） ================= */
@@ -520,16 +552,17 @@ async function notifyCheck(env) {
     const isAqua = g.channel === 'aqua'
     const verbSoon = isAqua ? '浮上します' : '攻撃可能になります'
     const verbNow = isAqua ? '浮上しました' : '攻撃可能になりました'
+    const lateHeader = '🌙 通知停止中などに' + (isAqua ? '浮上' : '攻撃可能') + 'になっていた対象'
 
     g.rows.sort((a, b) => a.event_at - b.event_at)
-    const dueLines = []
-    const lateLines = []
-    const touched = []
+    const dueItems = []
+    const lateItems = []
+    const silent = [] // 通知せずに「処理済み」にする対象
 
     g.rows.forEach((r) => {
       const left = r.event_at - now
       if (left > lead) return // まだ早い
-      if (st.types[r.type] === false) { touched.push(r); return } // 通知オフの種類は、通知せずに処理済みにする
+      if (st.types[r.type] === false) { silent.push(r); return } // 通知オフの種類
 
       const info = TYPE_INFO[r.type] || { name: r.type, icon: '📍' }
       const name = info.icon + ' ' + info.name + ' (' + r.x + ',' + r.y + ')' + (r.label ? ' ' + r.label : '')
@@ -537,29 +570,37 @@ async function notifyCheck(env) {
       const late = -left // 時刻から何ms過ぎたか（未到達なら負）
 
       if (late <= GRACE_MIN * 60000) {
-        dueLines.push(left > 0
-          ? '⏰ ' + name + ' が約' + Math.ceil(left / 60000) + '分後に' + verbSoon + '（' + when + '）'
-          : '🔔 ' + name + ' が' + verbNow + '（' + when + '）')
+        dueItems.push({
+          row: r,
+          text: left > 0
+            ? '⏰ ' + name + ' が約' + Math.ceil(left / 60000) + '分後に' + verbSoon + '（' + when + '）'
+            : '🔔 ' + name + ' が' + verbNow + '（' + when + '）'
+        })
       } else if (st.digest && late <= DIGEST_MAX_AGE_H * 3600000) {
-        lateLines.push('・' + name + '（' + when + '〜）')
+        lateItems.push({ row: r, text: '・' + name + '（' + when + '〜）' })
+      } else {
+        silent.push(r) // 遅れすぎ、またはまとめ通知がオフ
       }
-      touched.push(r)
     })
 
-    if (!touched.length) continue
-
-    const parts = []
-    if (dueLines.length) parts.push(dueLines.join('\n'))
-    if (lateLines.length) parts.push('🌙 通知停止中などに' + (isAqua ? '浮上' : '攻撃可能') + 'になっていた対象\n' + lateLines.join('\n'))
-    if (parts.length) {
-      const text = (st.roleId ? '<@&' + st.roleId + '>\n' : '') + parts.join('\n\n')
-      if (!(await sendDiscord(st.webhookUrl, text, st.roleId))) {
-        console.error('Discord送信に失敗しました。次回の実行で再試行します。')
-        continue // 失敗時は「通知済み」にしない
+    // 1通ずつ送り、届いた分だけを「通知済み」にする。失敗した時点で止めて、残りは次回に回す
+    const msgs = packMessages(dueItems, lateItems, st.roleId, lateHeader)
+    const done = silent.slice()
+    let sentCount = 0
+    for (let i = 0; i < msgs.length; i++) {
+      if (sentCount >= MAX_MESSAGES_PER_RUN) break // 残りは5分後の実行で送る
+      if (sentCount > 0) await sleep(MESSAGE_GAP_MS)
+      const res = await postDiscord(st.webhookUrl, msgs[i].text, st.roleId)
+      sentCount++
+      if (!res.ok) {
+        console.error('Discord送信に失敗しました（HTTP ' + res.status + '）。残りは次回の実行で再試行します。')
+        break
       }
+      msgs[i].rows.forEach((r) => done.push(r))
     }
 
-    const stmts = touched.map((r) =>
+    if (!done.length) continue
+    const stmts = done.map((r) =>
       env.DB.prepare('UPDATE items SET notified=event_at WHERE user_id=? AND channel=? AND item_key=? AND event_at=?')
         .bind(g.userId, g.channel, r.item_key, r.event_at)
     )
